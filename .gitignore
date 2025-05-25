@@ -1,0 +1,11 @@
+.venv/
+*.log
+*.json
+*.pdf
+*.txt
+*.docx
+*.doc
+*.xls
+*.xlsx
+*.pptx
+*.ppt
