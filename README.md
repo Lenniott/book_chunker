@@ -52,23 +52,86 @@ python book_processer.py path/to/book.pdf toc
 ## Example Output (truncated)
 ```json
 {
-  "title": "A Course in Miracles: Original Edition",
-  "author": "Helen Schucman",
-  "total_pages": 1626,
-  "outline": [
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Book Structure Schema",
+  "description": "Schema defining the structure of the book chunker output JSON",
+  "type": "object",
+  "required": ["title", "author", "total_pages", "outline"],
+  "properties": {
+    "title": {
+      "type": "string",
+      "description": "The full title of the book as extracted from the PDF metadata. This is typically found in the PDF's document information dictionary."
+    },
+    "author": {
+      "type": "string",
+      "description": "The author(s) of the book as extracted from the PDF metadata. Multiple authors may be separated by commas or other delimiters depending on the PDF's formatting."
+    },
+    "total_pages": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "The total number of pages in the PDF document. This is used for validation and to ensure all page references are within bounds."
+    },
+    "outline": {
+      "type": "array",
+      "description": "A hierarchical array representing the book's table of contents structure. Each element represents a top-level section or chapter.",
+      "items": {
+        "type": "object",
+        "required": ["title", "page"],
+        "properties": {
+          "title": {
+            "type": "string",
+            "description": "The title of the section or chapter as it appears in the book's table of contents. This is extracted directly from the PDF's outline structure."
+          },
+          "page": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "The page number where this section or chapter begins. This is a 1-based index (first page is 1, not 0)."
+          },
+          "children": {
+            "type": "array",
+            "description": "An array of subsections or subchapters that belong to this section. This creates the hierarchical structure of the book.",
+            "items": {
+              "$ref": "#/properties/outline/items"
+            }
+          },
+          "paragraphs": {
+            "type": "array",
+            "description": "An array of text paragraphs that belong to this section. These are only included for leaf nodes (sections without children) or for content that appears between subsections in parent nodes. Each paragraph is a complete thought or section of text as it appears in the book.",
+            "items": {
+              "type": "string",
+              "description": "A single paragraph of text from the book. Paragraphs are extracted using PyMuPDF's block detection and are merged intelligently to avoid awkward splits. They maintain the original formatting and line breaks as they appear in the book."
+            }
+          }
+        }
+      }
+    }
+  },
+  "examples": [
     {
-      "title": "Chapter 3. Retraining the Mind",
-      "page": 88,
-      "children": [
+      "title": "A Course in Miracles: Original Edition",
+      "author": "Helen Schucman",
+      "total_pages": 1626,
+      "outline": [
         {
-          "title": "I. Introduction",
+          "title": "Chapter 3. Retraining the Mind",
           "page": 88,
-          "paragraphs": [
-            "This is a course in mind training..."
+          "children": [
+            {
+              "title": "I. Introduction",
+              "page": 88,
+              "paragraphs": [
+                "This is a course in mind training..."
+              ]
+            }
           ]
         }
       ]
     }
-  ]
+  ],
+  "additionalProperties": false
 }
 ``` 
+
+
+
+

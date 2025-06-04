@@ -1,2 +1,5 @@
 PyPDF2
 PyMuPDF
+openai
+psycopg2-binary
+qdrant-client
