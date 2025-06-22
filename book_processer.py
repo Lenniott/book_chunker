@@ -5,6 +5,7 @@ import json
 import re
 import fitz  # PyMuPDF
 from PyPDF2.generic import IndirectObject
+from typing import Optional
 
 # Set up logging
 logging.basicConfig(
@@ -66,41 +67,76 @@ def print_outline_tree(outline, reader, level=0, parent_is_last_list=None):
         i += 1
 
 def clean_text(text):
+    """Clean text while preserving legitimate spacing and content."""
     if not text:
         return ''
-    text = re.sub(r'(?:[A-Za-z]\s){2,}[A-Za-z]', lambda m: m.group().replace(' ', ''), text)
+    # Remove multiple spaces but preserve paragraph structure
     return re.sub(r'\s+', ' ', text).strip()
 
 def extract_paragraphs_from_pages(reader, start_page, end_page, fitz_doc=None):
     """Extract paragraphs from a range of pages using fitz (PyMuPDF) for block extraction, with smart merging."""
+    if not fitz_doc:
+        return []
+
     paragraphs = []
-    if fitz_doc:
-        for i in range(start_page - 1, end_page):
-            page = fitz_doc.load_page(i)
-            blocks = page.get_text("blocks")
-            for block in blocks:
-                text = block[4].strip()
-                if text:
-                    cleaned = clean_text(text)
-                    if cleaned:
-                        paragraphs.append(cleaned)
-        # Smart merge: merge adjacent paragraphs if previous does not end with punctuation and next does not start with capital
-        merged = []
-        i = 0
-        while i < len(paragraphs):
-            current = paragraphs[i]
-            while (
-                i + 1 < len(paragraphs)
-                and not re.search(r'[.!?\u201d\u2019\"]$', current)
-                and paragraphs[i + 1] and not paragraphs[i + 1][0].isupper()
-            ):
-                current += ' ' + paragraphs[i + 1]
-                i += 1
-            merged.append(current)
-            i += 1
-        return merged
-    # fallback: just in case, but should not be used
-    return []
+    current_paragraph = []
+    last_block_bbox = None
+    
+    for i in range(start_page - 1, end_page):
+        page = fitz_doc.load_page(i)
+        blocks = page.get_text("blocks")
+        
+        # Sort blocks by vertical position then horizontal
+        blocks.sort(key=lambda b: (b[1], b[0]))
+        
+        for block in blocks:
+            text = block[4].strip()
+            if not text:
+                continue
+                
+            bbox = block[:4]  # x0, y0, x1, y1
+            
+            # Start new paragraph if:
+            # 1. Significant vertical gap
+            # 2. Different indentation
+            # 3. Previous paragraph ended with clear terminator
+            if current_paragraph and last_block_bbox:
+                vertical_gap = bbox[1] - last_block_bbox[3]  # y0 of current - y1 of last
+                indent_difference = abs(bbox[0] - last_block_bbox[0])  # x0 difference
+                last_text = current_paragraph[-1]
+                
+                new_paragraph = (
+                    vertical_gap > 1.5 * (bbox[3] - bbox[1]) or  # Gap > 1.5 times line height
+                    indent_difference > 20 or  # Significant indent change
+                    re.search(r'[.!?]\s*$', last_text) or  # Clear sentence ending
+                    (len(last_text) > 2 and last_text[-1] == '"' and last_text[-2] in '.!?') or  # Quote after sentence
+                    text[0].isupper()  # New sentence starts with capital
+                )
+                
+                if new_paragraph:
+                    merged = ' '.join(current_paragraph)
+                    if merged.strip():
+                        paragraphs.append(clean_text(merged))
+                    current_paragraph = []
+            
+            current_paragraph.append(text)
+            last_block_bbox = bbox
+        
+        # End paragraph at page boundary if it has content
+        if current_paragraph:
+            merged = ' '.join(current_paragraph)
+            if merged.strip():
+                paragraphs.append(clean_text(merged))
+            current_paragraph = []
+            last_block_bbox = None
+    
+    # Handle any remaining text
+    if current_paragraph:
+        merged = ' '.join(current_paragraph)
+        if merged.strip():
+            paragraphs.append(clean_text(merged))
+    
+    return paragraphs
 
 def outline_to_json(outline, reader, page_range=None, parent_is_last_list=None, fitz_doc=None, parent_end_page=None):
     if parent_is_last_list is None:
@@ -113,10 +149,19 @@ def outline_to_json(outline, reader, page_range=None, parent_is_last_list=None, 
         node = {}
         if hasattr(item, 'title') or (isinstance(item, dict) and '/Title' in item):
             title = getattr(item, 'title', None) or item.get('/Title', None)
+            # Skip nodes with no title or only whitespace in the title
+            if not title or not title.strip():
+                i += 1
+                continue
+            
             page_num = get_page_number(item, reader)
             if not page_num:
                 i += 1
                 continue
+
+            node['title'] = title
+            node['page'] = page_num
+
             # Find the next section's page number to determine this section's end
             next_page = None
             for j in range(i + 1, n):
@@ -136,56 +181,93 @@ def outline_to_json(outline, reader, page_range=None, parent_is_last_list=None, 
                 section_start = page_num
             node['title'] = title
             node['page'] = page_num
+            
+            # First get any paragraphs at the start of this node
+            node_paragraphs = []
+            if section_start <= section_end:
+                node_paragraphs = extract_paragraphs_from_pages(reader, section_start, section_end, fitz_doc=fitz_doc)
+            
             if i + 1 < n and isinstance(outline[i + 1], list):
                 children = outline[i + 1]
                 child_ranges = []
                 child_json = []
+                first_child_page = None
+                
+                # Find the first valid child page
+                for child in children:
+                    child_page = get_page_number(child, reader)
+                    if child_page is not None:
+                        first_child_page = child_page
+                        break
+                
+                # If we found a first child page, only keep paragraphs before it
+                if first_child_page is not None and node_paragraphs:
+                    # Extract text up to the first child
+                    node_paragraphs = extract_paragraphs_from_pages(reader, section_start, first_child_page - 1, fitz_doc=fitz_doc)
+                
+                # Process children
                 for ci, child in enumerate(children):
-                    if hasattr(child, 'title') or (isinstance(child, dict) and '/Title' in child):
-                        child_page = get_page_number(child, reader)
-                        next_child_page = None
-                        for cj in range(ci + 1, len(children)):
-                            next_child = children[cj]
-                            if hasattr(next_child, 'title') or (isinstance(next_child, dict) and '/Title' in next_child):
-                                next_child_page = get_page_number(next_child, reader)
-                                break
-                        child_end = next_child_page - 1 if next_child_page else section_end
-                        if page_range:
-                            child_start = max(child_page, section_start)
-                            child_end = min(child_end, section_end)
-                        else:
-                            child_start = child_page
-                        child_json.append(outline_to_json([child] + (children[ci+1:ci+2] if ci+1 < len(children) and isinstance(children[ci+1], list) else []), reader, (child_start, child_end), parent_is_last_list + [i == n - 1], fitz_doc=fitz_doc, parent_end_page=child_end))
-                        child_ranges.append((child_start, child_end))
-                node['children'] = [item for sublist in child_json for item in (sublist if isinstance(sublist, list) else [sublist])]
-                # Only add gaps strictly between children
-                gaps = []
-                sorted_ranges = sorted(child_ranges)
-                for idx in range(len(sorted_ranges) - 1):
-                    prev_end = sorted_ranges[idx][1]
-                    next_start = sorted_ranges[idx + 1][0]
-                    # Only add gap if strictly between children
-                    if prev_end + 1 <= next_start - 1:
-                        gap_start = prev_end + 1
-                        gap_end = next_start - 1
-                        # Enforce page_range boundaries
-                        if page_range:
-                            gap_start = max(gap_start, section_start)
-                            gap_end = min(gap_end, section_end)
+                    child_page = get_page_number(child, reader)
+                    if child_page is None:  # Skip children without valid page numbers
+                        continue
+                    next_child_page = None
+                    for cj in range(ci + 1, len(children)):
+                        next_child = children[cj]
+                        if hasattr(next_child, 'title') or (isinstance(next_child, dict) and '/Title' in next_child):
+                            next_child_page = get_page_number(next_child, reader)
+                            break
+                    child_end = next_child_page - 1 if next_child_page else section_end
+                    if page_range:
+                        child_start = max(child_page, section_start)
+                        child_end = min(child_end, section_end)
+                    else:
+                        child_start = child_page
+                    child_json.append(outline_to_json([child] + (children[ci+1:ci+2] if ci+1 < len(children) and isinstance(children[ci+1], list) else []), reader, (child_start, child_end), parent_is_last_list + [i == n - 1], fitz_doc=fitz_doc, parent_end_page=child_end))
+                    child_ranges.append((child_start, child_end))
+                
+                if child_ranges:  # Only process if we have valid ranges
+                    node['children'] = [item for sublist in child_json for item in (sublist if isinstance(sublist, list) else [sublist])]
+                    # Only add gaps strictly between children
+                    gaps = []
+                    sorted_ranges = sorted(child_ranges)
+                    for idx in range(len(sorted_ranges) - 1):
+                        prev_end = sorted_ranges[idx][1]
+                        next_start = sorted_ranges[idx + 1][0]
+                        # Only add gap if strictly between children
+                        if prev_end + 1 <= next_start - 1:
+                            gap_start = prev_end + 1
+                            gap_end = next_start - 1
+                            # Enforce page_range boundaries
+                            if page_range:
+                                gap_start = max(gap_start, section_start)
+                                gap_end = min(gap_end, section_end)
+                            if gap_start <= gap_end:
+                                gaps.append((gap_start, gap_end))
+                    gap_paragraphs = []
+                    for gap_start, gap_end in gaps:
                         if gap_start <= gap_end:
-                            gaps.append((gap_start, gap_end))
-                paragraphs = []
-                for gap_start, gap_end in gaps:
-                    if gap_start <= gap_end:
-                        paragraphs.extend(extract_paragraphs_from_pages(reader, gap_start, gap_end, fitz_doc=fitz_doc))
-                if paragraphs:
-                    node['paragraphs'] = paragraphs
-                i += 1  # skip children list
+                            gap_paragraphs.extend(extract_paragraphs_from_pages(reader, gap_start, gap_end, fitz_doc=fitz_doc))
+                        if gap_paragraphs:
+                            # Add gap paragraphs after the node's own paragraphs
+                            node_paragraphs.extend(gap_paragraphs)
+                    i += 1  # skip children list
             else:
                 if section_start <= section_end:
-                    paragraphs = extract_paragraphs_from_pages(reader, section_start, section_end, fitz_doc=fitz_doc)
-                    if paragraphs:
-                        node['paragraphs'] = paragraphs
+                    node_paragraphs = extract_paragraphs_from_pages(reader, section_start, section_end, fitz_doc=fitz_doc)
+            
+            # Add all collected paragraphs to the node
+            if node_paragraphs:
+                # Check for "Part II" in the introduction
+                if title == "Introduction" and node_paragraphs and "PART II" in node_paragraphs[0]:
+                    node['title'] = "Part II"
+                    # The rest of the first paragraph is just the title, so skip it
+                    if len(node_paragraphs) > 1:
+                        node['paragraphs'] = node_paragraphs[1:]
+                    else:
+                        node['paragraphs'] = []
+                else:
+                    node['paragraphs'] = node_paragraphs
+            
             result.append(node)
         i += 1
     return result

@@ -84,17 +84,18 @@ class BookDBLoader:
                      node_order: int,
                      depth: int = 0) -> uuid.UUID:
         """Process a single content node and its children recursively."""
-        # Check if node exists - Fixed the ambiguous column reference
+        # Use node_path from JSON if it exists, otherwise calculate it
+        node_path = node.get('node_path') or self._calculate_node_path(parent_path, node_order)
+        
+        # Check if node exists using node_path
         self.cursor.execute("""
             SELECT cn.id, vm.content_hash 
             FROM content_nodes cn
             LEFT JOIN vector_metadata vm ON cn.id = vm.content_node_id
-            WHERE cn.book_id = %s AND cn.title = %s AND cn.page_number = %s
-            AND (cn.parent_id = %s OR (cn.parent_id IS NULL AND %s IS NULL))
-        """, (book_id, node['title'], node['page'], parent_id, parent_id))
+            WHERE cn.book_id = %s AND cn.node_path = %s
+        """, (book_id, node_path))
         
         result = self.cursor.fetchone()
-        node_path = self._calculate_node_path(parent_path, node_order)
         
         if result:
             node_id, existing_hash = result
@@ -174,6 +175,57 @@ class BookDBLoader:
             self.conn.rollback()
             raise Exception(f"Error loading book: {str(e)}")
 
+    def delete_book(self, book_id: uuid.UUID) -> bool:
+        """Delete a book and all its associated data from the database.
+        
+        Args:
+            book_id: UUID of the book to delete
+            
+        Returns:
+            bool: True if book was found and deleted, False if book was not found
+        """
+        try:
+            # First check if book exists
+            self.cursor.execute("""
+                SELECT 1 FROM books WHERE id = %s
+            """, (book_id,))
+            
+            if not self.cursor.fetchone():
+                return False
+                
+            # Delete vector metadata for all content nodes of this book
+            self.cursor.execute("""
+                DELETE FROM vector_metadata
+                WHERE content_node_id IN (
+                    SELECT id FROM content_nodes WHERE book_id = %s
+                )
+            """, (book_id,))
+            
+            # Delete paragraphs for all content nodes of this book
+            self.cursor.execute("""
+                DELETE FROM paragraphs
+                WHERE content_node_id IN (
+                    SELECT id FROM content_nodes WHERE book_id = %s
+                )
+            """, (book_id,))
+            
+            # Delete all content nodes for this book
+            self.cursor.execute("""
+                DELETE FROM content_nodes WHERE book_id = %s
+            """, (book_id,))
+            
+            # Finally delete the book itself
+            self.cursor.execute("""
+                DELETE FROM books WHERE id = %s
+            """, (book_id,))
+            
+            self.conn.commit()
+            return True
+            
+        except Exception as e:
+            self.conn.rollback()
+            raise Exception(f"Error deleting book: {str(e)}")
+
 def load_book_to_db(json_file_path: str, db_connection_params: Dict[str, str]) -> uuid.UUID:
     """Convenience function to load a book from JSON to database."""
     with BookDBLoader(db_connection_params) as loader:
@@ -184,17 +236,13 @@ if __name__ == "__main__":
     import sys
     import os
     
-    # Check if JSON file path is provided
-    if len(sys.argv) != 2:
-        print("Usage: python db_loader.py <path_to_json_file>")
+    # Check command line arguments
+    if len(sys.argv) < 2:
+        print("Usage:")
+        print("  To load book:   python db_loader.py <path_to_json_file>")
+        print("  To delete book: python db_loader.py --delete <book_uuid>")
         print("Example: python db_loader.py book_structure.json")
-        sys.exit(1)
-    
-    json_file_path = sys.argv[1]
-    
-    # Check if file exists
-    if not os.path.exists(json_file_path):
-        print(f"Error: File '{json_file_path}' not found.")
+        print("Example: python db_loader.py --delete 123e4567-e89b-12d3-a456-426614174000")
         sys.exit(1)
     
     # Database connection parameters from environment
@@ -206,7 +254,33 @@ if __name__ == "__main__":
         "port": os.getenv("PG_PORT"),
     }
     
-    # Load the book
+    # Handle delete command
+    if sys.argv[1] == "--delete":
+        if len(sys.argv) != 3:
+            print("Error: Book UUID required for delete operation")
+            sys.exit(1)
+            
+        try:
+            book_id = uuid.UUID(sys.argv[2])
+            with BookDBLoader(db_params) as loader:
+                if loader.delete_book(book_id):
+                    print(f"Successfully deleted book with ID: {book_id}")
+                else:
+                    print(f"Book with ID {book_id} not found")
+        except ValueError:
+            print("Error: Invalid UUID format")
+            sys.exit(1)
+        except Exception as e:
+            print(f"Error: {str(e)}")
+            sys.exit(1)
+    
+    # Handle load command
+    else:
+        json_file_path = sys.argv[1]
+        if not os.path.exists(json_file_path):
+            print(f"Error: File '{json_file_path}' not found.")
+            sys.exit(1)
+        
     try:
         print(f"Loading book from: {json_file_path}")
         book_id = load_book_to_db(json_file_path, db_params)
