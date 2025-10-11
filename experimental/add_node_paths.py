@@ -15,9 +15,9 @@ def add_paths_to_nodes(nodes: List[Dict], parent_path: Optional[str] = None):
         current_path = f"{parent_path}.{i + 1}" if parent_path else str(i + 1)
         node['node_path'] = current_path
 
-        # If the node has children, recurse
-        if 'children' in node and node['children']:
-            add_paths_to_nodes(node['children'], current_path)
+        # If the node has sections, recurse
+        if 'sections' in node and node['sections']:
+            add_paths_to_nodes(node['sections'], current_path)
 
 def main(file_path: str):
     """

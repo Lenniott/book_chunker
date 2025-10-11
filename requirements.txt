@@ -1,5 +1,19 @@
-PyPDF2
-PyMuPDF
-openai
-psycopg2-binary
-qdrant-client
+# Core PDF processing
+PyPDF2>=3.0.0
+PyMuPDF>=1.23.0
+
+# Vector database and embeddings
+qdrant-client>=1.7.0
+openai>=1.0.0
+
+# Database (optional)
+psycopg2-binary>=2.9.0
+
+# Environment management
+python-dotenv>=1.0.0
+
+# Testing (optional)
+pytest>=7.4.0
+
+# Utilities
+typing-extensions>=4.8.0

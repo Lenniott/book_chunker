@@ -4,6 +4,7 @@ import logging
 import json
 import re
 import fitz  # PyMuPDF
+import base64
 from PyPDF2.generic import IndirectObject
 from typing import Optional, List, Dict, Tuple
 from collections import Counter
@@ -89,8 +90,7 @@ def detect_list_item(text: str) -> Dict[str, any]:
     list_info = {
         "is_list_item": False,
         "list_type": None,
-        "list_marker": None,
-        "list_content": text
+        "list_marker": None
     }
     
     if not text:
@@ -102,8 +102,7 @@ def detect_list_item(text: str) -> Dict[str, any]:
         list_info.update({
             "is_list_item": True,
             "list_type": "numbered",
-            "list_marker": numbered_match.group(1),
-            "list_content": numbered_match.group(2)
+            "list_marker": numbered_match.group(1)
         })
         return list_info
     
@@ -113,8 +112,7 @@ def detect_list_item(text: str) -> Dict[str, any]:
         list_info.update({
             "is_list_item": True,
             "list_type": "lettered",
-            "list_marker": lettered_match.group(1),
-            "list_content": lettered_match.group(2)
+            "list_marker": lettered_match.group(1)
         })
         return list_info
     
@@ -124,8 +122,7 @@ def detect_list_item(text: str) -> Dict[str, any]:
         list_info.update({
             "is_list_item": True,
             "list_type": "bullet",
-            "list_marker": bullet_match.group(1),
-            "list_content": bullet_match.group(2)
+            "list_marker": bullet_match.group(1)
         })
         return list_info
     
@@ -135,12 +132,152 @@ def detect_list_item(text: str) -> Dict[str, any]:
         list_info.update({
             "is_list_item": True,
             "list_type": "roman",
-            "list_marker": roman_match.group(1),
-            "list_content": roman_match.group(2)
+            "list_marker": roman_match.group(1)
         })
         return list_info
     
     return list_info
+
+def detect_figure_reference(text: str) -> Dict[str, any]:
+    """Detect if text contains figure references."""
+    text = text.strip()
+    
+    figure_info = {
+        "is_figure": False,
+        "figure_type": None,
+        "figure_number": None,
+        "figure_title": None
+    }
+    
+    # Common figure patterns
+    figure_patterns = [
+        r'^(FIGURE|Figure|Fig\.?)\s+(\d+(?:\.\d+)?)',  # FIGURE 7.6, Figure 1, Fig. 2.1
+        r'^(TABLE|Table)\s+(\d+(?:\.\d+)?)',          # TABLE 1, Table 2.1
+        r'^(CHART|Chart)\s+(\d+(?:\.\d+)?)',          # CHART 1
+        r'^(DIAGRAM|Diagram)\s+(\d+(?:\.\d+)?)',      # DIAGRAM 1
+        r'^(IMAGE|Image)\s+(\d+(?:\.\d+)?)',          # IMAGE 1
+    ]
+    
+    for pattern in figure_patterns:
+        match = re.match(pattern, text, re.IGNORECASE)
+        if match:
+            figure_type = match.group(1).lower()
+            figure_number = match.group(2)
+            
+            # Extract title if present (text after the figure reference)
+            remaining_text = text[match.end():].strip()
+            figure_title = remaining_text if remaining_text else None
+            
+            figure_info.update({
+                "is_figure": True,
+                "figure_type": figure_type,
+                "figure_number": figure_number,
+                "figure_title": figure_title
+            })
+            break
+    
+    return figure_info
+
+def extract_images_from_page(fitz_doc, page_num: int) -> List[Dict]:
+    """Extract all images from a specific page and convert to base64."""
+    try:
+        page = fitz_doc.load_page(page_num - 1)  # Convert to 0-indexed
+        images = []
+        image_list = page.get_images()
+        
+        logger.debug(f"Page {page_num}: Found {len(image_list)} images")
+        
+        for img_index, img in enumerate(image_list):
+            try:
+                # Get image reference
+                xref = img[0]
+                logger.debug(f"Page {page_num}, Image {img_index}: Processing xref {xref}")
+                
+                # Try multiple methods to extract image
+                img_data = None
+                img_ext = "png"  # Default format
+                width = None
+                height = None
+                
+                # Method 1: extract_image (preferred)
+                try:
+                    pix_dict = fitz_doc.extract_image(xref)
+                    img_data = pix_dict["image"]
+                    img_ext = pix_dict["ext"]
+                    logger.debug(f"Page {page_num}, Image {img_index}: Extracted via extract_image, format: {img_ext}, size: {len(img_data)} bytes")
+                except Exception as e1:
+                    logger.debug(f"Page {page_num}, Image {img_index}: extract_image failed: {str(e1)}")
+                    
+                    # Method 2: Create pixmap directly from xref
+                    try:
+                        pix = fitz.Pixmap(fitz_doc, xref)
+                        if pix.n - pix.alpha < 4:  # GRAY or RGB
+                            img_data = pix.tobytes("png")
+                            img_ext = "png"
+                            width = pix.width
+                            height = pix.height
+                            logger.debug(f"Page {page_num}, Image {img_index}: Extracted via Pixmap, size: {len(img_data)} bytes")
+                        pix = None  # Free memory
+                    except Exception as e2:
+                        logger.debug(f"Page {page_num}, Image {img_index}: Pixmap method failed: {str(e2)}")
+                        
+                        # Method 3: Get image through page rendering (fallback)
+                        try:
+                            # Get image bbox from page
+                            img_bbox = img[1:5] if len(img) > 4 else None  # x0, y0, x1, y1
+                            if img_bbox:
+                                # Render the specific area as image
+                                clip = fitz.Rect(img_bbox)
+                                mat = fitz.Matrix(2.0, 2.0)  # 2x zoom for better quality
+                                pix = page.get_pixmap(matrix=mat, clip=clip)
+                                img_data = pix.tobytes("png")
+                                img_ext = "png"
+                                width = pix.width
+                                height = pix.height
+                                logger.debug(f"Page {page_num}, Image {img_index}: Extracted via page rendering, size: {len(img_data)} bytes")
+                                pix = None
+                        except Exception as e3:
+                            logger.debug(f"Page {page_num}, Image {img_index}: Page rendering failed: {str(e3)}")
+                
+                if img_data and len(img_data) > 0:
+                    # Convert to base64
+                    img_base64 = base64.b64encode(img_data).decode()
+                    
+                    # Get dimensions if not already set
+                    if width is None or height is None:
+                        try:
+                            temp_pix = fitz.Pixmap(img_data)
+                            width = temp_pix.width
+                            height = temp_pix.height
+                            temp_pix = None
+                        except:
+                            width = width or 0
+                            height = height or 0
+                    
+                    images.append({
+                        "image_index": img_index,
+                        "format": img_ext,
+                        "base64": img_base64,
+                        "width": width,
+                        "height": height,
+                        "size_bytes": len(img_data),
+                        "extraction_method": "multiple_fallback"
+                    })
+                    
+                    logger.info(f"Page {page_num}: Successfully extracted image {img_index} ({img_ext}, {len(img_data)} bytes)")
+                else:
+                    logger.warning(f"Page {page_num}, Image {img_index}: Failed to extract image data with all methods")
+                
+            except Exception as e:
+                logger.warning(f"Page {page_num}, Image {img_index}: Unexpected error: {str(e)}")
+                continue
+        
+        logger.info(f"Page {page_num}: Successfully extracted {len(images)} out of {len(image_list)} images")
+        return images
+        
+    except Exception as e:
+        logger.error(f"Error processing page {page_num} for images: {str(e)}")
+        return []
 
 def extract_paragraphs_from_pages(reader, start_page, end_page, fitz_doc=None):
     """Extract paragraphs using the EXACT proven logic from book_processer.py, then add font metadata."""
@@ -226,13 +363,42 @@ def extract_paragraphs_from_pages(reader, start_page, end_page, fitz_doc=None):
                         break
                 
                 if next_text:
-                    # Continue paragraph if:
-                    # 1. Previous text doesn't end with sentence punctuation
-                    # 2. Next text starts with lowercase letter
-                    no_punctuation = not re.search(r'[.!?]\s*$', last_text)
-                    starts_lowercase = next_text[0].islower()
+                    # Enhanced cross-page logic:
+                    # Page breaks should NOT create paragraph breaks unless there's a logical reason
+                    # A paragraph can contain multiple sentences across pages
                     
-                    if no_punctuation and starts_lowercase:
+                    # Check if previous text ends with sentence punctuation
+                    ends_with_sentence = re.search(r'[.!?]\s*$', last_text)
+                    ends_with_colon = last_text.endswith(':')
+                    ends_with_comma = last_text.endswith(',')
+                    
+                    # Check if next text starts a new logical unit
+                    starts_with_lowercase = next_text[0].islower()
+                    starts_with_list_marker = re.match(r'^(\d+\.|[a-zA-Z]\.|[•\-\*\+▪▫◦‣⁃]|[ivxlcdmIVXLCDM]+\.)\s+', next_text)
+                    
+                    # Check for figure patterns that should be combined
+                    last_is_figure = re.match(r'^(FIGURE|Figure|Fig\.?|TABLE|Table|CHART|Chart|DIAGRAM|Diagram|IMAGE|Image)\s+\d+(?:\.\d+)?$', last_text.strip())
+                    next_is_caption = not re.match(r'^(FIGURE|Figure|Fig\.?|TABLE|Table|CHART|Chart|DIAGRAM|Diagram|IMAGE|Image)\s+\d+', next_text.strip())
+                    
+                    # Decision logic for page boundaries:
+                    if starts_with_list_marker:
+                        # New list item = always new paragraph (clear logical break)
+                        should_end_paragraph = True
+                    elif last_is_figure and next_is_caption:
+                        # FIGURE reference + caption = combine them
+                        should_end_paragraph = False
+                    elif not ends_with_sentence and starts_with_lowercase:
+                        # No sentence ending + lowercase = definitely continuing sentence
+                        should_end_paragraph = False
+                    elif ends_with_comma and starts_with_lowercase:
+                        # Comma + lowercase = definitely continuing sentence
+                        should_end_paragraph = False
+                    elif ends_with_colon:
+                        # Colon = likely continuing with explanation/list/example
+                        should_end_paragraph = False
+                    else:
+                        # Default: continue paragraph across page breaks
+                        # Page breaks alone don't create paragraph breaks
                         should_end_paragraph = False
             
             if should_end_paragraph:
@@ -240,8 +406,6 @@ def extract_paragraphs_from_pages(reader, start_page, end_page, fitz_doc=None):
                 if merged.strip():
                     paragraphs_text.append(clean_text(merged))
                 current_paragraph = []
-        
-        last_block_bbox = None
     
     # Handle any remaining text
     if current_paragraph:
@@ -291,7 +455,6 @@ def extract_paragraphs_from_pages(reader, start_page, end_page, fitz_doc=None):
                 "is_list_item": list_info["is_list_item"],
                 "list_type": list_info["list_type"],
                 "list_marker": list_info["list_marker"],
-                "list_content": list_info["list_content"] if list_info["is_list_item"] else None
             }
             enhanced_paragraphs.append(paragraph_info)
         else:
@@ -308,7 +471,6 @@ def extract_paragraphs_from_pages(reader, start_page, end_page, fitz_doc=None):
                 "is_list_item": list_info["is_list_item"],
                 "list_type": list_info["list_type"],
                 "list_marker": list_info["list_marker"],
-                "list_content": list_info["list_content"] if list_info["is_list_item"] else None
             }
             enhanced_paragraphs.append(paragraph_info)
     
@@ -402,39 +564,74 @@ def get_font_info_for_text_range(fitz_doc, page_num, text_content, bbox_hint=Non
         logger.debug(f"Error getting font info for page {page_num}: {str(e)}")
         return "unknown", 0.0, 0, False, False
 
-
-
 def add_font_metadata_to_paragraphs(paragraphs, fitz_doc):
     """Add font metadata to already-formed paragraphs by analyzing their content."""
-    enhanced_paragraphs = []
+    logger.info(f"Adding font metadata and figure detection to {len(paragraphs)} paragraphs...")
     
-    for para in paragraphs:
-        # Get font info for the primary page containing this paragraph
-        primary_page = para['pages'][0]
-        font_name, font_size, font_flags, is_bold, is_italic = get_font_info_for_text_range(
-            fitz_doc, primary_page, para['text']
-        )
+    for i, paragraph in enumerate(paragraphs):
+        text = paragraph.get('text', '')
+        pages = paragraph.get('pages', [])
         
-        # Detect list information
-        list_info = detect_list_item(para['text'])
+        if not text.strip():
+            continue
+            
+        # Get font metadata
+        primary_page = pages[0] if pages else 1
+        font_name, font_size, font_flags, is_bold, is_italic = get_font_info_for_text_range(fitz_doc, primary_page, text)
         
-        # Add font metadata
-        enhanced_para = para.copy()
-        enhanced_para.update({
-            "font_name": font_name,
-            "font_size": round(font_size, 2),
-            "font_flags": font_flags,
-            "is_bold": is_bold,
-            "is_italic": is_italic,
-            "is_list_item": list_info["is_list_item"],
-            "list_type": list_info["list_type"],
-            "list_marker": list_info["list_marker"],
-            "list_content": list_info["list_content"] if list_info["is_list_item"] else None
+        # Detect lists
+        list_info = detect_list_item(text)
+        
+        # Detect figures
+        figure_info = detect_figure_reference(text)
+        
+        # Extract images if this relates to a figure and we have page info
+        images = []
+        if pages and (figure_info["is_figure"] or "FIGURE" in text.upper() or "TABLE" in text.upper() or "CHART" in text.upper()):
+            # For figures, check current page AND surrounding pages (±2 pages)
+            pages_to_check = set()
+            for page_num in pages:
+                # Add current page and surrounding pages
+                for offset in range(-2, 3):  # -2, -1, 0, +1, +2
+                    check_page = page_num + offset
+                    if check_page > 0:  # Ensure valid page number
+                        pages_to_check.add(check_page)
+            
+            # Extract images from all candidate pages
+            for page_num in sorted(pages_to_check):
+                page_images = extract_images_from_page(fitz_doc, page_num)
+                if page_images:
+                    # Add page info to each image for tracking
+                    for img in page_images:
+                        img["source_page"] = page_num
+                    images.extend(page_images)
+        
+        # Update paragraph with all metadata
+        paragraph.update({
+            'font_name': font_name,
+            'font_size': font_size,
+            'font_flags': font_flags,
+            'is_bold': is_bold,
+            'is_italic': is_italic,
+            'is_list_item': list_info['is_list_item'],
+            'list_type': list_info['list_type'],
+            'list_marker': list_info['list_marker'],
+            'is_figure': figure_info['is_figure'],
+            'figure_type': figure_info['figure_type'],
+            'figure_number': figure_info['figure_number'],
+            'figure_title': figure_info['figure_title'],
+            'images': images
         })
         
-        enhanced_paragraphs.append(enhanced_para)
+        if (i + 1) % 100 == 0:
+            logger.info(f"Processed {i + 1}/{len(paragraphs)} paragraphs...")
     
-    return enhanced_paragraphs
+    # Log summary
+    figure_count = sum(1 for p in paragraphs if p.get('is_figure', False))
+    image_count = sum(len(p.get('images', [])) for p in paragraphs)
+    logger.info(f"Font metadata complete. Found {figure_count} figures with {image_count} total images.")
+    
+    return paragraphs
 
 def outline_to_json_with_fonts(outline, reader, page_range=None, parent_is_last_list=None, fitz_doc=None, parent_end_page=None):
     """Convert PDF outline to JSON with detailed font analysis for paragraphs."""

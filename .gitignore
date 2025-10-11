@@ -1,11 +1,70 @@
-.venv/
-*.log
-*.json
-*.pdf
-*.docx
-*.doc
-*.xls
-*.xlsx
-*.pptx
-*.ppt
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Environment
 .env
+.venv
+venv/
+
+# Logs
+*.log
+*.log.*
+
+# Output files
+book_structure*.json
+font_structure*.json
+*_sectioned.json
+*_combined.json
+*_analysis_*.json
+output/*.json
+!output/.gitkeep
+
+# Test outputs
+extracted_books/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints
+
+# PDF files (usually large, don't commit)
+*.pdf
+
+# Analysis outputs
+analysis_*.log
+combination_analysis_*.log
+content_analysis_*.json
+chunked_analysis_*.json
+
+# Temporary files
+tmp/
+temp/
+*.tmp

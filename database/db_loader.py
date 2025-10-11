@@ -4,10 +4,12 @@ import os
 import json
 import psycopg2
 from psycopg2.extras import Json, register_uuid
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 import uuid
 from datetime import datetime
 import hashlib
+import base64
+import re
 
 # Register UUID type with psycopg2
 register_uuid()
@@ -75,6 +77,63 @@ class BookDBLoader:
         """Calculate a hash of the content for change detection."""
         content = "".join(paragraphs)
         return hashlib.sha256(content.encode()).hexdigest()
+    
+    def _process_images(self, paragraph_data: Dict[str, Any], content_node_id: uuid.UUID, paragraph_id: Optional[uuid.UUID] = None):
+        """Process images from paragraph data and store them in the database."""
+        if 'images' not in paragraph_data or not paragraph_data['images']:
+            return
+        
+        # Delete existing images for this content node/paragraph
+        if paragraph_id:
+            self.cursor.execute("""
+                DELETE FROM images 
+                WHERE paragraph_id = %s
+            """, (paragraph_id,))
+        else:
+            self.cursor.execute("""
+                DELETE FROM images 
+                WHERE content_node_id = %s AND paragraph_id IS NULL
+            """, (content_node_id,))
+        
+        # Insert new images
+        for i, image_data in enumerate(paragraph_data['images']):
+            # Extract image metadata
+            base64_data = image_data.get('base64', '')
+            if not base64_data:
+                continue
+                
+            # Calculate image size in bytes (approximate from base64)
+            image_size_bytes = len(base64_data.encode('utf-8'))
+            
+            # Try to determine image format from base64 header
+            image_format = 'unknown'
+            if base64_data.startswith('/9j/'):
+                image_format = 'jpg'
+            elif base64_data.startswith('iVBORw0KGgo'):
+                image_format = 'png'
+            elif base64_data.startswith('R0lGODlh'):
+                image_format = 'gif'
+            
+            # Extract other metadata if available
+            width = image_data.get('width')
+            height = image_data.get('height')
+            metadata = {k: v for k, v in image_data.items() if k not in ['base64', 'width', 'height']}
+            
+            self.cursor.execute("""
+                INSERT INTO images 
+                (content_node_id, paragraph_id, image_data, image_format, 
+                 image_size_bytes, width, height, image_order, metadata)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (content_node_id, paragraph_id, base64_data, image_format, 
+                  image_size_bytes, width, height, i, Json(metadata)))
+    
+    def _extract_paragraph_text(self, paragraph_data: Any) -> str:
+        """Extract text content from paragraph data (handles both string and dict formats)."""
+        if isinstance(paragraph_data, str):
+            return paragraph_data
+        elif isinstance(paragraph_data, dict):
+            return paragraph_data.get('text', '')
+        return str(paragraph_data)
 
     def _process_node(self, 
                      node: Dict, 
@@ -83,7 +142,7 @@ class BookDBLoader:
                      parent_path: Optional[str],
                      node_order: int,
                      depth: int = 0) -> uuid.UUID:
-        """Process a single content node and its children recursively."""
+        """Process a single content node and its sections recursively."""
         # Use node_path from JSON if it exists, otherwise calculate it
         node_path = node.get('node_path') or self._calculate_node_path(parent_path, node_order)
         
@@ -117,25 +176,57 @@ class BookDBLoader:
             """, (node_id, book_id, parent_id, node['title'], node['page'],
                   node_path, depth, node_order, bool(node.get('paragraphs'))))
 
+        # Process header_paragraph if it exists
+        if 'header_paragraph' in node:
+            header = node['header_paragraph']
+            text_content = self._extract_paragraph_text(header)
+            
+            # Create a special paragraph for the header
+            paragraph_id = uuid.uuid4()
+            word_count = len(text_content.split()) if text_content else 0
+            char_count = len(text_content) if text_content else 0
+            
+            self.cursor.execute("""
+                INSERT INTO paragraphs 
+                (content_node_id, content, paragraph_order, word_count, char_count)
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING id
+            """, (node_id, text_content, -1, word_count, char_count))  # -1 indicates header
+            paragraph_id = self.cursor.fetchone()[0]
+            
+            # Process images in header paragraph
+            if isinstance(header, dict):
+                self._process_images(header, node_id, paragraph_id)
+
         # Process paragraphs if they exist
         if 'paragraphs' in node and node['paragraphs']:
-            content_hash = self._get_content_hash(node['paragraphs'])
+            # Calculate content hash for change detection
+            paragraph_texts = [self._extract_paragraph_text(p) for p in node['paragraphs']]
+            content_hash = self._get_content_hash(paragraph_texts)
             
-            # Delete existing paragraphs
+            # Delete existing paragraphs (except header)
             self.cursor.execute("""
                 DELETE FROM paragraphs 
-                WHERE content_node_id = %s
+                WHERE content_node_id = %s AND paragraph_order >= 0
             """, (node_id,))
             
             # Insert new paragraphs
-            for i, paragraph in enumerate(node['paragraphs']):
-                word_count = len(paragraph.split())
-                char_count = len(paragraph)
+            for i, paragraph_data in enumerate(node['paragraphs']):
+                text_content = self._extract_paragraph_text(paragraph_data)
+                word_count = len(text_content.split()) if text_content else 0
+                char_count = len(text_content) if text_content else 0
+                
                 self.cursor.execute("""
                     INSERT INTO paragraphs 
                     (content_node_id, content, paragraph_order, word_count, char_count)
                     VALUES (%s, %s, %s, %s, %s)
-                """, (node_id, paragraph, i, word_count, char_count))
+                    RETURNING id
+                """, (node_id, text_content, i, word_count, char_count))
+                paragraph_id = self.cursor.fetchone()[0]
+                
+                # Process images in this paragraph if it's a dict with images
+                if isinstance(paragraph_data, dict):
+                    self._process_images(paragraph_data, node_id, paragraph_id)
             
             # Update vector metadata if content changed
             if not result or existing_hash != content_hash:
@@ -144,10 +235,10 @@ class BookDBLoader:
                     WHERE content_node_id = %s
                 """, (node_id,))
 
-        # Process children recursively
-        if 'children' in node:
-            for i, child in enumerate(node['children']):
-                self._process_node(child, book_id, node_id, node_path, i + 1, depth + 1)
+        # Process sections recursively (replaces the old 'children' logic)
+        if 'sections' in node and node['sections']:
+            for i, section in enumerate(node['sections']):
+                self._process_node(section, book_id, node_id, node_path, i + 1, depth + 1)
 
         return node_id
 
@@ -196,6 +287,14 @@ class BookDBLoader:
             # Delete vector metadata for all content nodes of this book
             self.cursor.execute("""
                 DELETE FROM vector_metadata
+                WHERE content_node_id IN (
+                    SELECT id FROM content_nodes WHERE book_id = %s
+                )
+            """, (book_id,))
+            
+            # Delete images for all content nodes of this book
+            self.cursor.execute("""
+                DELETE FROM images
                 WHERE content_node_id IN (
                     SELECT id FROM content_nodes WHERE book_id = %s
                 )
