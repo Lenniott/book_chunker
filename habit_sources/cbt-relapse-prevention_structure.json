@@ -1,0 +1,28 @@
+{
+  "title": "Untitled",
+  "author": "Danielle Edgar",
+  "total_pages": 1,
+  "outline": [
+    {
+      "title": "Document Content",
+      "page": 1,
+      "start_page": 1,
+      "end_page": 1,
+      "content": [
+        "Relapse Prevention Plan",
+        "Use this template to capture the key learning points from the CBT process and identify action required to limit and manage potential future setbacks. 1. What have I learnt about the old problem?",
+        "2. What are my high-risk situations?",
+        "3. What are the key signs? - (Thoughts / Feelings / Behaviours / Symptoms)",
+        "4. What can I do to maintain momentum and build on my gains?",
+        "5. What action will I take in case of a relapse?",
+        "© Think CBT 2016 – 01732 808 626 | info@thinkcbt.com |"
+      ]
+    }
+  ],
+  "extraction_info": {
+    "source": "habit sources/cbt-relapse-prevention.pdf",
+    "hierarchy_detection": false,
+    "images_extracted": false,
+    "extractor_version": "2.0-fixed"
+  }
+}

@@ -97,6 +97,34 @@ def is_italic(flags):
     return bool(flags & 2**1)
 
 
+def assign_node_ids(nodes: List[Dict[str, Any]], parent_id: Optional[str] = None) -> None:
+    """
+    Recursively assign deterministic node IDs (e.g., "2.3.1") to each section.
+    """
+    if not nodes:
+        return
+
+    counter = 0
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        counter += 1
+        node_id = f"{parent_id}.{counter}" if parent_id else str(counter)
+        node["node_id"] = node_id
+
+        # Explore children defined either in `content` list or `sections`.
+        child_nodes: List[Dict[str, Any]] = []
+        content_items = node.get("content")
+        if isinstance(content_items, list):
+            child_nodes.extend(item for item in content_items if isinstance(item, dict))
+
+        section_items = node.get("sections")
+        if isinstance(section_items, list):
+            child_nodes.extend(item for item in section_items if isinstance(item, dict))
+
+        assign_node_ids(child_nodes, node_id)
+
+
 def extract_sections_from_page_range(fitz_doc, start_page, end_page, extract_images=False):
     """
     Extract hierarchical sections from a page range using font analysis.
@@ -253,6 +281,7 @@ def extract_sections_from_page_range(fitz_doc, start_page, end_page, extract_ima
         section = {
             'title': section_data['title'],
             'page': section_data['page'],
+            'level': section_data['level'],
             'content': []
         }
         
@@ -273,58 +302,58 @@ def extract_sections_from_page_range(fitz_doc, start_page, end_page, extract_ima
         # Track for paragraph extraction
         all_sections_flat_for_paras.append(section)
     
-    # Phase 4: Build content arrays with proper ordering and flatten redundant structures
-    # For each section, we need to insert paragraphs before the first child subsection
-    for i, section in enumerate(all_sections_flat_for_paras):
-        section_start = section['page']
-        
-        # Find section end (next sibling or parent's end)
-        section_end = end_page
-        
-        # Look for next section at same or higher level
-        for j in range(i + 1, len(all_sections_flat_for_paras)):
-            next_section = all_sections_flat_for_paras[j]
-            # If next section exists, this section ends before it
-            section_end = next_section['page'] - 1
-            break
-        
-        # Find the first child subsection to determine where paragraphs should go
-        first_child_page = None
-        for child in section.get('content', []):
-            if isinstance(child, dict) and 'page' in child:
-                if first_child_page is None or child['page'] < first_child_page:
-                    first_child_page = child['page']
-        
-        # Determine paragraph extraction range
-        if first_child_page:
-            para_end = first_child_page - 1
-        else:
-            para_end = section_end
-        
-        # Extract paragraphs for this section (before first child)
-        if section_start <= para_end:
+        # Phase 4: Build content arrays with proper ordering using heading-based boundaries
+        # For each section, we need to extract paragraphs that logically belong to it
+        for i, section in enumerate(all_sections_flat_for_paras):
+            section_start = section['page']
+            section_level = section.get('level', 0)
+            
+            # Find the end of this section by looking for the next section at same or higher level
+            section_end = end_page
+            for j in range(i + 1, len(all_sections_flat_for_paras)):
+                next_section = all_sections_flat_for_paras[j]
+                next_level = next_section.get('level', 0)
+                # If next section is at same or higher level, this section ends before it
+                if next_level <= section_level:
+                    section_end = next_section['page'] - 1
+                    break
+            
+            # Extract paragraphs for this section's page range
             paragraphs = extract_paragraphs_from_pages(
                 None,  # reader not needed
                 section_start,
-                para_end,
+                section_end,
                 fitz_doc
             )
             
-            # Insert paragraphs at the beginning of content array
-            # They come before any subsections
-            for paragraph in reversed(paragraphs):
+            # Filter paragraphs to only include those that belong to this section
+            # Remove paragraphs that are actually headings for subsections
+            filtered_paragraphs = []
+            for paragraph in paragraphs:
+                # Skip if this paragraph matches a subsection title
+                is_heading = False
+                for subsection in section.get('content', []):
+                    if isinstance(subsection, dict) and subsection.get('title', '').lower() in paragraph.lower():
+                        is_heading = True
+                        break
+                
+                if not is_heading:
+                    filtered_paragraphs.append(paragraph)
+            
+            # Insert filtered paragraphs at the beginning of content array
+            for paragraph in reversed(filtered_paragraphs):
                 section['content'].insert(0, paragraph)
         
-        # Extract images if requested
-        if extract_images:
-            section_images = []
-            for page_num in range(section_start, section_end + 1):
-                page_images = extract_images_from_page(fitz_doc, page_num)
-                if page_images:
-                    section_images.extend(page_images)
-            
-            if section_images:
-                section['images'] = section_images
+            # Extract images if requested
+            if extract_images:
+                section_images = []
+                for page_num in range(section_start, section_end + 1):
+                    page_images = extract_images_from_page(fitz_doc, page_num)
+                    if page_images:
+                        section_images.extend(page_images)
+                
+                if section_images:
+                    section['images'] = section_images
     
     # Phase 5: Clean up redundant content and merge duplicate structures
     def clean_content(content_list, parent_title="", parent_page=None):
@@ -458,6 +487,8 @@ def process_pdf_hybrid(pdf_path, output_file=None, extract_images=False, use_hie
                     chapters.append(chapter)
             i += 1
         
+        assign_node_ids(chapters)
+
         output = {
             'title': title,
             'author': author,
